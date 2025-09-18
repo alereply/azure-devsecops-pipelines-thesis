@@ -1,0 +1,420 @@
+parameters:
+  - name: AZURE_SERVICE_CONNECTION
+    type: string
+    default: '<your-azure-service-connection-name>'
+
+  - name: API_LIST
+    type: object
+    default:
+      - name: 'owasp-crapi' # Example public test application
+    displayName: 'List of APIs to scan'
+
+  - name: targetEnvironment
+    displayName: 'Target Environment to Scan'
+    type: string
+    default: dev
+    values:
+      - dev
+      - prod
+
+  # Parameters for the configurable Security Gate
+  - name: SECURITY_GATE_MODE
+    displayName: 'Risk Evaluation Mode for Security Gate'
+    type: string
+    default: 'flexible'
+    values:
+    - cvss_only
+    - severity_only
+    - flexible
+    - strict
+
+  - name: CVSS_SCORE_THRESHOLD
+    displayName: 'General CVSS Threshold'
+    type: number
+    default: 7.0
+
+  - name: FAIL_ON_SEVERITY_LEVELS
+    displayName: 'Fail on these Severity Levels (comma-separated)'
+    type: string
+    default: 'Critical,High'
+
+  - name: CRITICAL_VULNERABILITY_TYPES
+    displayName: 'Critical Vulnerability Types (comma-separated)'
+    type: string
+    default: 'authentication,authorization,injection'
+    
+  - name: STRICT_METHODS
+    displayName: 'HTTP Methods for Stricter Checks (for strict mode)'
+    type: string
+    default: 'GET,POST,PUT,DELETE'
+  
+  - name: STRICT_METHODS_CVSS_THRESHOLD
+    displayName: 'CVSS Threshold for Strict Methods (for strict mode)'
+    type: number
+    default: 5.0
+
+
+trigger: none
+
+pool:
+  name: '<your-agent-pool-name>'
+
+variables:
+  # Replace with the names of your variable groups in Azure DevOps
+  - group: '<your-apisec-credentials-variable-group>'
+  - group: '<your-general-automation-variable-group>'
+  - group: '<your-cosign-secrets-variable-group>'
+  - group: '<your-blob-storage-variable-group>'
+
+  # Dynamically set variables based on the targetEnvironment parameter
+  - ${{ if eq(parameters.targetEnvironment, 'dev') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_DEV)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_DEV)
+    - name: CurrentApimGatewayUrl
+      value: $(APIM_HOST_DEV)
+  - ${{ if eq(parameters.targetEnvironment, 'prod') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_PROD)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_PROD)
+    - name: CurrentApimGatewayUrl
+      value: $(APIM_HOST_PROD)
+
+jobs:
+- job: Run_APIsec_Scans
+  timeoutInMinutes: 180
+  displayName: 'Scan APIs and retrieve results with APIsec'
+  steps:
+    - checkout: none
+
+    - task: AzureKeyVault@2
+      displayName: 'Download secrets from Azure Key Vault'
+      inputs:
+        azureSubscription: '<your-kv-service-connection-name>'
+        KeyVaultName: '$(cosignKeyVaultName)'
+        SecretsFilter: '*'
+
+    - bash: |
+        set -euo pipefail
+        mkdir -p "$(Build.ArtifactStagingDirectory)/dast-reports"
+        mkdir -p "$(Build.ArtifactStagingDirectory)/dast-signatures"
+        echo "$(cosign-private-key)" | base64 -d > cosign.key
+        echo "$(cosign-public-key)"  | base64 -d > cosign.pub
+      displayName: 'Prepare Keys and Directories'
+      
+    - task: AzureCLI@2
+      name: scanWithAPIsec
+      displayName: 'Download Spec, Scan API, and Get Results'
+      inputs:
+        azureSubscription: ${{ parameters.AZURE_SERVICE_CONNECTION }}
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          
+          # Set variables from the pipeline context
+          RESOURCE_GROUP="$(CurrentResourceGroupName)"
+          APIM_NAME="$(CurrentApimInstanceName)"
+          APIM_GATEWAY_URL="$(CurrentApimGatewayUrl)"
+          
+          mkdir -p apisec-reports
+          echo '${{ convertToJson(parameters.API_LIST) }}' > api_list.json
+
+          # Loop through each API defined in the parameters
+          for row in $(cat api_list.json | jq -r '.[] | @base64'); do
+              _jq() { echo ${row} | base64 --decode | jq -r ${1}; }
+              API_ID=$(_jq '.name')
+              echo "--- Processing API: $API_ID ---"
+
+              # STEP 1: Export Spec from APIM and configure APIsec application
+              echo "Downloading OpenAPI spec for $API_ID..."
+              az apim api export --service-name "$APIM_NAME" --resource-group "$RESOURCE_GROUP" --api-id "$API_ID" --export-format OpenApiJsonFile --file-path . --output json
+              mv "./${API_ID}_openapi+json.json" "${API_ID}.json"
+              
+              API_SUFFIX=$(az apim api show --service-name "$APIM_NAME" --resource-group "$RESOURCE_GROUP" --api-id "$API_ID" --query path -o tsv)
+              FULL_INSTANCE_URL="${APIM_GATEWAY_URL}/${API_SUFFIX}"
+              
+              echo "Creating APIsec application for $API_ID..."
+              CREATE_RES=$(curl -s -w "\n%{http_code}" -X POST https://api.apisecapps.com/v1/applications/oas -H "Authorization: Bearer $APISEC_TOKEN" -F "applicationName=$API_ID" -F "origin=TENANT_PORTAL" -F "fileUpload=@${API_ID}.json;type=application/json")
+              HTTP_CODE=$(echo "$CREATE_RES" | tail -n1); CREATE_BODY=$(echo "$CREATE_RES" | sed '$d')
+              if [ "$HTTP_CODE" -ne "200" ]; then echo "##[error]APIsec app creation failed. Status: $HTTP_CODE"; exit 1; fi
+              APP_ID=$(echo "$CREATE_BODY" | jq -r '.applicationId')
+              
+              echo "Creating scan instance for host: $FULL_INSTANCE_URL"
+              INSTANCE_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.apisecapps.com/v1/applications/$APP_ID/instances/batch" -H "Authorization: Bearer $APISEC_TOKEN" -H "Content-Type: application/json" -d "{ \"instanceRequestItems\": [{ \"hostUrl\": \"$FULL_INSTANCE_URL\" }] }")
+              if [ "$INSTANCE_HTTP_CODE" -ne 200 ]; then echo "##[error]Adding APIsec instance failed. Status: $INSTANCE_HTTP_CODE."; exit 1; fi
+              
+              # STEP 2: Poll for the new instance ID to be available
+              RETRY_TIMEOUT=120; RETRY_INTERVAL=10; ELAPSED=0; INSTANCE_ID="null"
+              echo "Polling for new instance ID..."
+              while [ "$INSTANCE_ID" == "null" ]; do
+                  if [ $ELAPSED -ge $RETRY_TIMEOUT ]; then echo "##[error]Timeout while polling for instance ID."; exit 1; fi
+                  APP_DETAILS=$(curl -s -X GET "https://api.apisecapps.com/v1/applications/$APP_ID" -H "Authorization: Bearer $APISEC_TOKEN")
+                  INSTANCE_ID=$(echo "$APP_DETAILS" | jq -r --arg url "$FULL_INSTANCE_URL" '.instances | map(select(.hostUrl == $url)) | max_by(.updatedAt) | .instanceId // "null"')
+                  if [ "$INSTANCE_ID" == "null" ]; then sleep $RETRY_INTERVAL; ELAPSED=$(($ELAPSED + $RETRY_INTERVAL)); fi
+              done
+              echo "Instance ID found: $INSTANCE_ID"
+
+          # STEP 3: Start the scan, retrying if the service is not ready
+          RETRY_SCAN_TIMEOUT=1200; RETRY_SCAN_INTERVAL=30; ELAPSED=0; SCAN_STARTED=false
+          echo "Attempting to start scan..."
+          while [ "$SCAN_STARTED" = false ]; do
+              if [ $ELAPSED -ge $RETRY_SCAN_TIMEOUT ]; then echo "##[error]Timeout while trying to start scan."; exit 1; fi
+              SCAN_PAYLOAD='{ "endpointIds": [], "scanWithAuthId": "" }'
+              SCAN_RES=$(curl -s -w "\n%{http_code}" -X POST "https://api.apisecapps.com/v1/applications/$APP_ID/instances/$INSTANCE_ID/scan" -H "Authorization: Bearer $APISEC_TOKEN" -H "Content-Type: application/json" -d "$SCAN_PAYLOAD")
+              HTTP_CODE=$(echo "$SCAN_RES" | tail -n1)
+              if [ "$HTTP_CODE" -eq "200" ]; then
+                  SCAN_BODY=$(echo "$SCAN_RES" | sed '$d'); SCAN_ID=$(echo "$SCAN_BODY" | jq -r '.scanId'); echo "Scan initiated. ID: $SCAN_ID"; SCAN_STARTED=true;
+              else 
+                  echo "##[warning]Scan start failed with HTTP code ${HTTP_CODE}. Retrying..."
+                  sleep $RETRY_SCAN_INTERVAL
+                  ELAPSED=$(($ELAPSED + $RETRY_SCAN_INTERVAL))
+              fi
+          done
+
+          # STEP 4: Poll for scan completion
+          POLLING_TIMEOUT=5400; POLLING_INTERVAL=180; ELAPSED=0; SCAN_STATUS=""
+          echo "Polling for scan completion..."
+          while [ "$SCAN_STATUS" != "Complete" ]; do
+              if [ $ELAPSED -ge $POLLING_TIMEOUT ]; then echo "##[error]Scan timeout exceeded."; exit 1; fi
+              SCAN_DETAILS_RES=$(curl -s -w "\n%{http_code}" -X GET "https://api.apisecapps.com/v1/applications/$APP_ID/instances/$INSTANCE_ID/scans/$SCAN_ID" -H "Authorization: Bearer $APISEC_TOKEN")
+              HTTP_CODE=$(echo "$SCAN_DETAILS_RES" | tail -n1)
+              SCAN_DETAILS=$(echo "$SCAN_DETAILS_RES" | sed '$d')
+
+              if [ "$HTTP_CODE" -eq "200" ]; then
+                  SCAN_STATUS=$(echo "$SCAN_DETAILS" | jq -r '.status')
+                  PERCENTAGE=$(echo "$SCAN_DETAILS" | jq -r '.metadata.completionPercentage // 0')
+                  echo "Current status: $SCAN_STATUS ($PERCENTAGE%)"
+
+                  if [ "$SCAN_STATUS" == "Failed" ]; then 
+                      echo "##[error]Scan failed according to API status."; exit 1;
+                  fi
+              fi
+              
+              if [ "$SCAN_STATUS" != "Complete" ]; then 
+                  sleep $POLLING_INTERVAL; ELAPSED=$(($ELAPSED + $POLLING_INTERVAL));
+              fi
+          done
+          echo "Scan completed."
+
+          # STEP 5: Download the report
+          DETECTIONS_FILE="$(Build.ArtifactStagingDirectory)/dast-reports/${API_ID}-detections.json"
+          echo "Downloading detections report to $DETECTIONS_FILE..."
+          curl -s -X GET "https://api.apisecapps.com/v1/applications/$APP_ID/instances/$INSTANCE_ID/detections?include=metadata&excludeDetectionsWithStatus=FALSE_POSITIVE" -H "Authorization: Bearer $APISEC_TOKEN" -o "$DETECTIONS_FILE"
+              # STEP 6: Security Gate
+              echo "=================================================================="
+              echo "Running Enhanced Security Gate Analysis"
+              echo "Mode: ${{ parameters.SECURITY_GATE_MODE }}"
+              echo "=================================================================="
+
+              # Parse parameters into arrays
+              IFS=',' read -ra SEVERITY_LEVELS <<< "$(echo '${{ parameters.FAIL_ON_SEVERITY_LEVELS }}' | tr -d ' ')"
+              IFS=',' read -ra STRICT_METHODS <<< "$(echo '${{ parameters.STRICT_METHODS }}' | tr -d ' ')"  
+              IFS=',' read -ra CRITICAL_VULN_TYPES <<< "$(echo '${{ parameters.CRITICAL_VULNERABILITY_TYPES }}' | tr -d ' ')"
+
+              CVSS_THRESHOLD="${{ parameters.CVSS_SCORE_THRESHOLD }}"
+              STRICT_CVSS_THRESHOLD="${{ parameters.STRICT_METHODS_CVSS_THRESHOLD }}"
+              SECURITY_MODE="${{ parameters.SECURITY_GATE_MODE }}"
+
+              echo "Configuration:"
+              echo "  CVSS Threshold: $CVSS_THRESHOLD"
+              echo "  Strict Methods CVSS: $STRICT_CVSS_THRESHOLD" 
+              echo "  Fail on Severities: ${SEVERITY_LEVELS[*]}"
+              echo "  Strict Methods: ${STRICT_METHODS[*]}"
+              echo "  Critical Vuln Types: ${CRITICAL_VULN_TYPES[*]}"
+              echo ""
+
+              VULNERABILITY_FOUND=false
+
+              # Helper function to check array membership
+              contains_element() {
+                local element="$1"
+                shift
+                for item in "$@"; do
+                  [[ "$item" == "$element" ]] && return 0
+                done
+                return 1
+              }
+
+              # Helper function to normalize strings for vulnerability type matching
+              normalize_string() {
+                echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g'
+              }
+
+              # Process each active vulnerability
+              while read -r vuln_line; do
+                if [[ -z "$vuln_line" ]]; then continue; fi
+                
+                # Parse vulnerability data from JSON line
+                CVSS_SCORE=$(echo "$vuln_line" | jq -r '.testResult.cvssScore // 0')
+                CVSS_QUALIFIER=$(echo "$vuln_line" | jq -r '.testResult.cvssQualifier // "Unknown"')
+                HTTP_METHOD=$(echo "$vuln_line" | jq -r '.method // "GET"')
+                DETECTION_ID=$(echo "$vuln_line" | jq -r '.detectionId // "unknown"')
+                VULN_RESOURCE=$(echo "$vuln_line" | jq -r '.resource // "/"')
+                
+                echo "Analyzing: $DETECTION_ID (Score: $CVSS_SCORE, Severity: $CVSS_QUALIFIER, Method: $HTTP_METHOD)"
+                
+                VULN_FAILED=false
+                
+                # Rule 1: Critical vulnerability types (bypass all other checks)
+                if [[ "$SECURITY_MODE" == "flexible" || "$SECURITY_MODE" == "strict" ]]; then
+                  NORMALIZED_DETECTION=$(normalize_string "$DETECTION_ID")
+                  for vuln_type in "${CRITICAL_VULN_TYPES[@]}"; do
+                    NORMALIZED_TYPE=$(normalize_string "$vuln_type")
+                    if [[ "$NORMALIZED_DETECTION" == *"$NORMALIZED_TYPE"* ]]; then
+                      echo " CRITICAL TYPE: Always fails for '$vuln_type' vulnerabilities"
+                      VULN_FAILED=true
+                      break
+                    fi
+                  done
+                fi
+                
+                # Rule 2: Severity-based checks
+                if [[ "$VULN_FAILED" == false && ("$SECURITY_MODE" == "severity_only" || "$SECURITY_MODE" == "flexible" || "$SECURITY_MODE" == "strict") ]]; then
+                  if contains_element "$CVSS_QUALIFIER" "${SEVERITY_LEVELS[@]}"; then
+                    echo " SEVERITY EXCEEDED: $CVSS_QUALIFIER is in fail list"
+                    VULN_FAILED=true
+                  fi
+                fi
+                
+                # Rule 3: CVSS score-based checks
+                if [[ "$VULN_FAILED" == false && ("$SECURITY_MODE" == "cvss_only" || "$SECURITY_MODE" == "flexible" || "$SECURITY_MODE" == "strict") ]]; then
+                  if [[ "$CVSS_SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    THRESHOLD_TO_USE=$CVSS_THRESHOLD
+                    
+                    # Use stricter threshold for specific HTTP methods
+                    if [[ "$SECURITY_MODE" == "strict" ]] && contains_element "$HTTP_METHOD" "${STRICT_METHODS[@]}"; then
+                      THRESHOLD_TO_USE=$STRICT_CVSS_THRESHOLD
+                      echo "    Using strict threshold ($STRICT_CVSS_THRESHOLD) for $HTTP_METHOD"
+                    fi
+                    
+                    if awk -v score="$CVSS_SCORE" -v thresh="$THRESHOLD_TO_USE" 'BEGIN {exit !(score >= thresh)}'; then
+                      echo " CVSS EXCEEDED: $CVSS_SCORE >= $THRESHOLD_TO_USE"
+                      VULN_FAILED=true
+                    fi
+                  fi
+                fi
+                
+                if [[ "$VULN_FAILED" == true ]]; then
+                  VULNERABILITY_FOUND=true
+                  echo "   FAILED SECURITY GATE"
+                else
+                  echo "   Passed security checks"
+                fi
+                
+              done < <(jq -r '.detections[].data.vulnerabilities[] | select(.status == "ACTIVE") | @json' "$DETECTIONS_FILE")
+
+              # Final decision
+              echo "=================================================================="
+              if [[ "$VULNERABILITY_FOUND" == true ]]; then
+                echo " SECURITY GATE FAILED for API: $API_ID"
+                echo "##vso[task.complete result=Failed;]Pipeline failed due to security policy violations (mode: $SECURITY_MODE)"
+              else
+                echo " SECURITY GATE PASSED for API: $API_ID"
+              fi
+              echo "=================================================================="
+              
+          done
+      env:
+        APISEC_TOKEN: $(APISEC_TOKEN)
+
+
+# 3. Sign and verify each scan report
+# Reports are searched in a generic 'reports' directory to avoid exposing internal naming conventions.
+- bash: |
+    set -e
+    REPORTS_DIR="$(Build.ArtifactStagingDirectory)/reports"
+    SIGNATURES_DIR="$(Build.ArtifactStagingDirectory)/signatures"
+    
+    mkdir -p "$SIGNATURES_DIR"
+
+    # Check if reports exist before proceeding
+    if [ -z "$(ls -A $REPORTS_DIR/*.json 2>/dev/null)" ]; then
+      echo "No JSON reports found in $REPORTS_DIR. Skipping signing step."
+      exit 0
+    fi
+
+    for report in "$REPORTS_DIR"/*.json; do
+      if [ -f "$report" ]; then
+        filename=$(basename "$report")
+        echo "Signing report: $filename"
+        cosign sign-blob --yes \
+          --key cosign.key "$report" \
+          --output-signature "$SIGNATURES_DIR/${filename}.sig"
+        
+        echo "Verifying signature for: $filename"
+        cosign verify-blob \
+          --key cosign.pub \
+          --signature "$SIGNATURES_DIR/${filename}.sig" "$report"
+      fi
+    done
+  displayName: 'Sign & Verify Scan Reports'
+  env:
+    # The password for the Cosign key is retrieved from a pipeline secret variable.
+    COSIGN_PASSWORD: $(cosign-password)
+  condition: always()
+
+# 4. Create a single ZIP archive
+# The archive contains all reports and their corresponding signatures.
+- bash: |
+    cd "$(Build.ArtifactStagingDirectory)"
+    ARCHIVE_NAME="scan-results-$(date +%Y%m%dT%H%M%S).zip"
+    
+    # Check if there are files to zip to avoid errors
+    if [ -n "$(find reports -type f -name '*.json')" ]; then
+      zip -r "$ARCHIVE_NAME" reports/ signatures/
+      echo "Created ZIP archive: $ARCHIVE_NAME"
+      echo "##vso[task.setvariable variable=reportArchiveName]$ARCHIVE_NAME"
+    else
+      echo "No reports generated, skipping archive creation."
+      echo "##vso[task.setvariable variable=reportArchiveName]none"
+    fi
+  displayName: "Create ZIP Archive (Reports + Signatures)"
+  condition: always()
+
+# 5. Upload the ZIP archive to secure storage
+# Use Managed Identity for authentication, avoiding hardcoded credentials.
+- bash: |
+    set -euo pipefail
+    ARCHIVE_NAME="$(reportArchiveName)"
+    
+    if [ "$ARCHIVE_NAME" == "none" ] || [ -z "$ARCHIVE_NAME" ]; then
+      echo "No archive to upload. Skipping step."
+      exit 0
+    fi
+
+    echo "Authenticating via Managed Identity..."
+    az login --identity > /dev/null 2>&1
+
+    echo "Uploading $ARCHIVE_NAME to secure storage..."
+    az storage blob upload \
+      --auth-mode login \
+      --account-name "$STORAGE_ACCOUNT_NAME" \
+      --container-name "$STORAGE_CONTAINER_NAME" \
+      --name "$ARCHIVE_NAME" \
+      --file "$(Build.ArtifactStagingDirectory)/$ARCHIVE_NAME" \
+      --only-show-errors
+    echo "Upload complete."
+  displayName: "Upload Archive to Secure Storage"
+  condition: always()
+  env:
+    # The storage account and container names are defined as pipeline variables.
+    STORAGE_ACCOUNT_NAME: $(AZURE_STORAGE_ACCOUNT)
+    STORAGE_CONTAINER_NAME: $(AZURE_WORM_CONTAINER)
+
+# 6. Publish artifacts for debugging
+# Makes the generated files available for analysis.
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Scan Artifacts for Debug'
+  condition: always()
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)'
+    artifact: 'Scan_Artifacts_For_Debug'
+
+# 7. Securely delete keys
+# Use 'shred' to overwrite the key files before deleting them.
+- bash: shred -u cosign.key cosign.pub
+  displayName: 'Delete Cosign Keys'
+  condition: always()
