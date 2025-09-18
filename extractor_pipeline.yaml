@@ -1,0 +1,294 @@
+parameters:
+  - name: targetEnvironment
+    displayName: 'Target Environment to Extract from'
+    type: string
+    default: dev
+    values:
+      - dev
+      - prod
+      
+  - name: TARGET_FOLDER
+    displayName: 'Target folder for extracted APIs'
+    type: string
+    default: 'APIs'
+
+  - name: REPOSITORY_NAME
+    type: string
+    default: '<your-repository-name>'
+    displayName: Repository for pull request
+
+  - name: TARGET_BRANCH_NAME
+    type: string
+    displayName: Target branch for pull request
+    default: main
+
+  - name: CONFIGURATION_YAML_PATH
+    type: string
+    displayName: Optional configuration file
+    values:
+      - Extract All
+      - configuration.extractor.yaml
+    default: configuration.extractor.yaml
+
+  - name: API_SPECIFICATION_FORMAT
+    type: string
+    displayName: API Specification Format
+    values:
+      - OpenAPIV3Yaml
+      - OpenAPIV3Json
+    default: OpenAPIV3Yaml
+
+  - name: APIM_VERSION
+    type: string
+    displayName: Named value id of apim to retrive the apim version
+    default: apim-version
+
+trigger: none
+
+variables:
+  - group: '<your-variable-group-name>' 
+  - name: System.Debug
+    value: true
+  - ${{ if eq(parameters.targetEnvironment, 'dev') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_DEV)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_DEV)
+  - ${{ if eq(parameters.targetEnvironment, 'prod') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_PROD)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_PROD)
+
+stages:
+  - stage: create_artifact_from_portal
+    displayName: 'Stage 1: Extract, Lint, and Create Artifact'
+    jobs:
+      - job: extractor_job
+        displayName: 'Extract API configuration from Azure'
+        workspace:
+          clean: all
+        pool:
+          name: '<your-agent-pool-name>' 
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Set authentication variables for extractor'
+            inputs:
+              azureSubscription: '<your-service-connection-name>'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                # This script securely retrieves authentication tokens from the
+                # service connection and makes them available as secret variables.
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_BEARER_TOKEN]$(az account get-access-token --query "accessToken" --output tsv)"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_CLIENT_ID]$env:servicePrincipalId"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_CLIENT_SECRET]$env:servicePrincipalKey"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_TENANT_ID]$env:tenantId"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_SUBSCRIPTION_ID]$(az account show --query "id" --output tsv)"
+              addSpnToEnvironment: true
+              failOnStandardError: true
+
+          - task: PowerShell@2
+            displayName: 'Fetch and prepare APIOps extractor tool'
+            inputs:
+              targetType: "inline"
+              script: |
+                # This script downloads the correct version of the Azure APIOps
+                # extractor tool based on the agent's operating system.
+                $releaseFileName = "extractor-linux-x64.zip"
+                $executableFileName = "extractor"
+
+                $uri = "https://github.com/Azure/apiops/releases/latest/download/$releaseFileName"
+                $downloadFilePath = Join-Path "$(Agent.TempDirectory)" $releaseFileName
+                Invoke-WebRequest -Uri "$uri" -OutFile "$downloadFilePath"
+
+                $executableFolderPath = Join-Path "$(Agent.TempDirectory)" "extractor"
+                Expand-Archive -Path "$downloadFilePath" -DestinationPath "$executableFolderPath"
+                $executableFilePath = Join-Path "$executableFolderPath" $executableFileName
+                
+                if ("$(Agent.OS)" -like "*linux*") {
+                    & chmod +x "$executableFilePath"
+                }
+
+                Write-Host "##vso[task.setvariable variable=EXTRACTOR_FILE_PATH]$executableFilePath"
+              failOnStderr: true
+              pwsh: true
+
+          - task: PowerShell@2
+            displayName: 'Run extractor to generate API configuration files'
+            inputs:
+              targetType: "inline"
+              script: |
+                & "$(EXTRACTOR_FILE_PATH)"
+                if ($LASTEXITCODE -ne 0) { throw "Running extractor failed."}
+              failOnStderr: true
+              pwsh: true
+            env:
+              AZURE_BEARER_TOKEN: $(AZURE_BEARER_TOKEN)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+              AZURE_RESOURCE_GROUP_NAME: $(CurrentResourceGroupName)
+              API_MANAGEMENT_SERVICE_NAME: $(CurrentApimInstanceName)
+              API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH: $(Build.ArtifactStagingDirectory)/${{ parameters.TARGET_FOLDER }}
+              API_SPECIFICATION_FORMAT: ${{ parameters.API_SPECIFICATION_FORMAT }}
+              ${{ if ne( parameters['CONFIGURATION_YAML_PATH'], 'Extract All' ) }}:
+                CONFIGURATION_YAML_PATH: ${{ parameters.CONFIGURATION_YAML_PATH }}
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: 'Install Node.js for Spectral'
+
+          - script: 'npm install -g @stoplight/spectral-cli'
+            displayName: 'Install Spectral CLI'
+
+          - script: |
+              spectral lint --format stylish --format junit --output.junit $(Build.ArtifactStagingDirectory)/spectral-result.xml $(Build.ArtifactStagingDirectory)/${{ parameters.TARGET_FOLDER }}/apis/**/specification.{json,yaml,yml} -r <your-spectral-ruleset-url.yaml>
+            displayName: 'Run Spectral Linting'
+            continueOnError: true
+            failOnStderr: true
+          
+          - task: PublishTestResults@2
+            displayName: 'Publish Spectral Linting Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/spectral-result.xml'
+              searchFolder: $(Build.ArtifactStagingDirectory)
+              failTaskOnFailedTests: false
+          
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish extracted files as artifact'
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)"
+              artifactType: pipeline
+              artifactName: artifacts-from-portal
+
+          - task: Bash@3
+            displayName: 'Generate and upload pipeline summary'
+            inputs:
+              targetType: 'inline'
+              script: |
+                outputFilePath="$(Build.ArtifactStagingDirectory)/run-extractor.md"
+                apiDirectoryPath="$(Build.ArtifactStagingDirectory)/${{ parameters.TARGET_FOLDER }}"
+                cd "$apiDirectoryPath"
+                
+                echo "# Azure APIM Modifications Summary" > "$outputFilePath"
+                echo '```' >> "$outputFilePath"
+                tree -d --noreport . >> "$outputFilePath"
+                echo '```' >> "$outputFilePath"
+
+                echo "##vso[task.uploadsummary]$outputFilePath"
+
+  - stage: create_git_branch
+    displayName: 'Stage 2: Create Git Branch and Pull Request'
+    jobs:
+      - job: create_pull_request
+        displayName: 'Create Pull Request with extracted artifacts'
+        pool:
+          name: '<your-agent-pool-name>'
+        steps:
+        - checkout: self
+          displayName: 'Checkout target repository'
+          persistCredentials: true
+
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download extracted artifacts'
+          inputs:
+            source: current
+            artifactName: artifacts-from-portal
+            targetPath: $(System.DefaultWorkingDirectory)
+
+        - task: PowerShell@2
+          displayName: 'Commit files and create Pull Request'
+          inputs:
+            targetType: "inline"
+            script: |
+              az extension add --name "azure-devops"
+              az devops configure --defaults organization="$(System.TeamFoundationCollectionUri)" project="$(System.TeamProject)"
+
+              $temporaryBranchName = "feature/extractor-build-$(Build.BuildId)"
+              $targetBranchName = "${{ parameters.TARGET_BRANCH_NAME }}"
+              $repositoryName = "${{ parameters.REPOSITORY_NAME }}"
+              
+              git checkout -b "$temporaryBranchName"
+              
+              # Add and commit the changes
+              git config --global user.email "pipeline-agent@example.com"
+              git config --global user.name "Azure DevOps Pipeline"
+              git add --all
+              
+              # Check if there are changes to commit
+              if (-not (git status --porcelain)) {
+                  Write-Information "No changes detected. Skipping Pull Request."
+                  return
+              }
+              
+              git commit -m "feat: Extract API configuration from $(CurrentApimInstanceName)"
+              git push --set-upstream origin "$temporaryBranchName"
+
+              # Create the pull request
+              az repos pr create --source-branch "$temporaryBranchName" `
+                                 --target-branch "$targetBranchName" `
+                                 --title "Automated API Extraction from $(CurrentApimInstanceName)" `
+                                 --squash `
+                                 --delete-source-branch "true" `
+                                 --repository "$repositoryName"
+            pwsh: true
+          env:
+            AZURE_DEVOPS_EXT_PAT: "$(System.AccessToken)"
+
+  - stage: TagMergedCode
+    displayName: 'Stage 3: Tag Merged Code After PR Approval'
+    dependsOn: create_git_branch
+    condition: succeeded()
+    jobs:
+      - deployment: tag_after_PR_merge
+        displayName: 'Tag main branch after PR merge'
+        pool:
+          name: '<your-agent-pool-name>'
+        environment: '<your-deployment-environment-name>'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: self
+                displayName: 'Checkout repo for tagging'
+                persistCredentials: true
+                
+              - task: DownloadPipelineArtifact@2
+                displayName: 'Download artifacts to read version'
+                inputs:
+                  source: 'current'
+                  artifact: 'artifacts-from-portal'
+                  path: '$(Pipeline.Workspace)/artifacts'
+
+              - task: PowerShell@2
+                name: ReadVersionFromFileTask
+                displayName: 'Read version from artifact file'
+                inputs:
+                  targetType: 'inline'
+                  pwsh: true
+                  script: |
+                    $jsonPath = "$(Pipeline.Workspace)/artifacts/${{ parameters.TARGET_FOLDER }}/named values/${{ parameters.APIM_VERSION }}/namedValueInformation.json"
+                    $jsonContent = Get-Content -Path $jsonPath | ConvertFrom-Json
+                    $version = $jsonContent.properties.value
+                    Write-Host "Found version from artifact: $version"
+                    Write-Host "##vso[task.setvariable variable=VersionFromFile;isOutput=true]$version"
+
+              - task: Bash@3
+                displayName: 'Create and Push Git Tag'
+                inputs:
+                  targetType: 'inline'
+                  script: |
+                    set -e
+                    VERSION_TAG="v$(ReadVersionFromFileTask.VersionFromFile)"
+                    
+                    if git rev-parse "$VERSION_TAG" >/dev/null 2>&1; then
+                        echo "Tag $VERSION_TAG already exists. Skipping tagging."
+                    else
+                        echo "Tagging repository with $VERSION_TAG"
+                        git tag "$VERSION_TAG" -m "APIM Release $VERSION_TAG"
+                        git push origin "$VERSION_TAG"
+                    fi
