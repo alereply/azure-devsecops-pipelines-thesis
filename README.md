@@ -47,7 +47,7 @@ This pipeline serves as a critical safety net to ensure service continuity after
 * **Validates API functionality** by checking for expected HTTP status codes, with support for chained requests.
 * **Features an automated rollback capability**: If any API health check fails, the pipeline is designed to **automatically restore the environment to its last known-good version** by redeploying the code from the previous stable Git tag.
 
-### Dynamic Security Testing (DAST)
+### Dynamic Security Testing
 This pipeline scans the running application to find runtime vulnerabilities.
 * **Performs dynamic security testing** against live API endpoints using the APIsec platform.
 * **Features a highly configurable security gate** to automatically evaluate scan results based on CVSS scores, severity levels ('Critical', 'High', etc.), and specific vulnerability types.
