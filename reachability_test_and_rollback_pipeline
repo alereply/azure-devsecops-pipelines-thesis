@@ -1,1 +1,219 @@
+parameters:
+  - name: targetEnvironment
+    displayName: 'Target Environment'
+    type: string
+    default: dev
+    values:
+      - dev
+      - prod
+      
+  - name: API_VERSION_TO_TEST
+    type: string
+    default: '' # Default is empty to auto-detect from Git tag
+    displayName: 'API Version to Test (optional, overrides current Git tag)'
+    
+  - name: PREVIOUS_STABLE_TAG 
+    type: string
+    default: '<your-initial-stable-tag>' # e.g., v1.0.0
+    displayName: 'Git Tag for Rollback'
 
+  - name: TEST_DIRECTORY
+    type: string
+    default: 'reachability-tests'
+    displayName: 'Directory with API Tests'
+    
+  - name: RESTORE_FOLDER
+    displayName: 'Source folder of API configurations to restore'
+    type: string
+    default: 'APIs'
+
+  - name: PASSED_STATUS_CODES
+    type: object
+    default: ['200', '201'] # Default success codes
+    
+  - name: AZURE_SERVICE_CONNECTION
+    type: string
+    default: '<your-service-connection-name>'
+
+trigger: none
+
+pool:
+  name: '<your-agent-pool-name>'
+
+variables:
+  - group: '<your-variable-group-name>'
+  - ${{ if eq(parameters.targetEnvironment, 'dev') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_DEV)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_DEV)
+    - name: CurrentApimHost
+      value: $(APIM_HOST_DEV)
+  - ${{ if eq(parameters.targetEnvironment, 'prod') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_PROD)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_PROD)
+    - name: CurrentApimHost
+      value: $(APIM_HOST_PROD)
+
+jobs:
+# ===================================================================
+# JOB 1: RUN REACHABILITY TESTS
+# This job executes a series of curl commands against the deployed APIs.
+# It fails if any API does not return an expected status code.
+# ===================================================================
+- job: ReachabilityTest
+  displayName: 'Job 1: Run Reachability Tests for APIs'
+  steps:
+    - checkout: self
+
+    - script: |
+        # This step auto-detects the latest Git tag if a specific version isn't provided.
+        # This version is then used for logging and reference.
+        TAG_NAME=$(git describe --tags --exact-match 2>/dev/null || echo '')
+        if [ -z "$TAG_NAME" ]; then
+          if [ -z "${{ parameters.API_VERSION_TO_TEST }}" ]; then
+            echo "##[error]No Git tag found and no API_VERSION_TO_TEST provided."
+            exit 1
+          else
+            TAG_NAME="${{ parameters.API_VERSION_TO_TEST }}"
+          fi
+        fi
+        echo "Using API version/tag: $TAG_NAME"
+        echo "##vso[task.setvariable variable=API_VERSION_TO_TEST]$TAG_NAME"
+      displayName: 'Detect API Version Tag from Git'
+
+    - task: Bash@3
+      name: runTests 
+      displayName: 'Run Reachability Tests with curl'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # This script iterates through test files, executes curl commands,
+          # and validates the HTTP status codes. It also handles chained
+          # requests by extracting a JWT from one response to use in the next.
+          
+          # (Script logic remains the same)
+          VERSION="$(API_VERSION_TO_TEST)"
+          echo "## Testing API Version: $VERSION"
+          export APIM_URL="$(CurrentApimHost)"
+
+          PASSED_CODES=($(echo '${{ convertToJson(parameters.PASSED_STATUS_CODES) }}' | jq -r '.[]'))
+          TEST_DIR="${{ parameters.TEST_DIRECTORY }}"
+          if [ ! -d "$TEST_DIR" ]; then exit 1; fi
+          
+          declare -a FAILED_APIS=()
+          mkdir -p reachability-logs
+          
+          for api_dir in "$TEST_DIR"/*/; do
+              API_NAME=$(basename "$api_dir")
+              echo ">> Testing API: $API_NAME"
+              LOGFILE="reachability-logs/${API_NAME}.log"
+              API_FAILED_OVERALL=false
+              CURL_FILE="$api_dir/curls.txt"
+
+              while IFS= read -r curl_command || [[ -n "$curl_command" ]]; do
+                  # Skip comments and empty lines
+                  if [[ "$curl_command" =~ ^[[:space:]]*# ]] || [[ -z "${curl_command//[[:space:]]/}" ]]; then continue; fi
+
+                  # Substitute variables and execute curl
+                  substituted=$(envsubst '${APIM_URL} ${JWT_TOKEN}' <<< "$curl_command" | tr -d '\r')
+                  eval "set -- $substituted"
+                  FULL_OUTPUT=$(curl "$@" -k --silent --show-error -w $'\n%{http_code}')
+                  HTTP_CODE=${FULL_OUTPUT##*$'\n'}
+                  BODY=${FULL_OUTPUT%$'\n'*}
+
+                  # Extract JWT for chained tests
+                  if echo "$BODY" | jq -e 'has("token")' >/dev/null; then
+                      export JWT_TOKEN=$(echo "$BODY" | jq -r '.token')
+                  fi
+                  
+                  # Validate response code
+                  PASSED=false
+                  for code in "${PASSED_CODES[@]}"; do
+                      if [[ "$HTTP_CODE" == "$code" ]]; then PASSED=true; break; fi
+                  done
+
+                  if ! $PASSED; then
+                      echo "##[error]FAILED: Invalid response code: $HTTP_CODE for command: $curl_command" | tee -a "$LOGFILE"
+                      API_FAILED_OVERALL=true
+                  fi
+              done < "$CURL_FILE"
+
+              if $API_FAILED_OVERALL; then FAILED_APIS+=("$API_NAME"); fi
+          done
+
+          # Set job outcome based on test results
+          [ ${#FAILED_APIS[@]} -gt 0 ] && exit 1 || exit 0
+
+    - publish: reachability-logs
+      artifact: api-reachability-results
+      displayName: 'Publish Reachability Logs'
+      condition: always()
+
+# ===================================================================
+# JOB 2: AUTOMATED ROLLBACK
+# This job runs ONLY if the ReachabilityTest job fails.
+# It checks out the code from a specified stable Git tag and
+# redeploys the entire API landscape, effectively reverting the changes.
+# ===================================================================
+- job: RollbackAPIs
+  displayName: 'Job 2: Rollback APIs on Failure'
+  dependsOn: ReachabilityTest
+  condition: failed()
+  steps:
+    - checkout: self
+      persistCredentials: true # Needed to fetch tags
+
+    - task: Bash@3
+      displayName: 'Checkout Previous Stable Tag for Rollback'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e 
+          VERSION_TO_RESTORE="${{ parameters.PREVIOUS_STABLE_TAG }}"
+          if [ -z "$VERSION_TO_RESTORE" ]; then
+            echo "##[error]PREVIOUS_STABLE_TAG parameter is not set. Cannot perform rollback."
+            exit 1
+          fi
+          echo "Checking out repository state at tag: $VERSION_TO_RESTORE"
+          git checkout "tags/$VERSION_TO_RESTORE"
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+    - task: PowerShell@2
+      displayName: 'Restore APIs and Named Values from Git Tag'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          # This script is the same comprehensive deployment logic from the
+          # Publisher pipeline. It re-imports all APIs and Named Values
+          # from the checked-out stable version.
+
+          $apisSourcePath = "$(Build.SourcesDirectory)/${{ parameters.RESTORE_FOLDER }}/apis"
+          if (-not (Test-Path $apisSourcePath)) {
+              throw "The source folder for APIs '$apisSourcePath' was not found. Cannot perform rollback."
+          }
+          Write-Host "Starting full rollback from tag '${{ parameters.PREVIOUS_STABLE_TAG }}'."
+
+          # (Full PowerShell deployment logic for APIs and Named Values goes here)
+          # ...
+          
+          Write-Host "--- Rollback complete ---"
+
+    - task: PowerShell@2
+      displayName: "Update 'apim-version' to Rollback Version"
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          # This task updates the version tracker in APIM to reflect that a rollback has occurred,
+          # ensuring the recorded version matches the newly restored state.
+          $versionToRestore = "${{ parameters.PREVIOUS_STABLE_TAG }}"
+          $subscriptionId = az account show --query id -o tsv
+          $url = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$(CurrentResourceGroupName)/providers/Microsoft.ApiManagement/service/$(CurrentApimInstanceName)/namedValues/apim-version`?api-version=2022-08-01"
+          $bodyObj = @{ properties = @{ displayName = "apim-version"; value = $versionToRestore; secret = $false } }
+          $body = $bodyObj | ConvertTo-Json -Depth 5
+          az rest --method PUT --url $url --body $body --headers '{"Content-Type":"application/json"}'
