@@ -1,0 +1,190 @@
+parameters:
+  - name: targetEnvironment
+    displayName: 'Target Environment to Deploy'
+    type: string
+    default: dev
+    values:
+      - dev
+      - prod
+      
+  - name: API_FOLDER_PATH
+    type: string
+    displayName: 'Folder where the APIs are located'
+    default: 'APIs'
+    
+  - name: APIM_VERSION
+    type: string
+    displayName: 'APIM Version to publish'
+    default: ''
+
+trigger: none
+
+pool:
+  name: '<your-agent-pool-name>'
+
+variables:
+  - group: '<your-variable-group-name>'
+  - ${{ if eq(parameters.targetEnvironment, 'dev') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_DEV)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_DEV)
+  - ${{ if eq(parameters.targetEnvironment, 'prod') }}:
+    - name: CurrentApimInstanceName
+      value: $(APIM_NAME_PROD)
+    - name: CurrentResourceGroupName
+      value: $(RESOURCE_GROUP_NAME_PROD)
+
+stages:
+  # ===================================================================
+  # STAGE 1: DEPLOY TO DEVELOPMENT ENVIRONMENT
+  # ===================================================================
+  - stage: Deploy_DEV
+    displayName: 'Deploy APIs to DEV'
+    condition:  eq('${{ parameters.targetEnvironment }}', 'dev')
+    jobs:
+      - deployment: Deploy_APIs_DEV
+        displayName: 'Publishing to APIM DEV'
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: PowerShell@2
+                  displayName: 'Publish APIs & Named Values to APIM DEV'
+                  inputs:
+                    targetType: 'inline'
+                    pwsh: true
+                    script: |
+                      # This script deploys APIs and Named Values to the Development environment.
+
+                      $newVersion = "${{ parameters.APIM_VERSION }}"
+                      if ([string]::IsNullOrWhiteSpace($newVersion)) {
+                          throw "APIM_VERSION parameter is missing or empty. Aborting deployment."
+                      }
+                      $baseFolder = "$(System.DefaultWorkingDirectory)/${{ parameters.API_FOLDER_PATH }}"
+                      
+                      # Deploy APIs
+                      $apisPath = Join-Path $baseFolder "apis"
+                      if (Test-Path -Path $apisPath) {
+                          Get-ChildItem -Path $apisPath -Directory | ForEach-Object {
+                              $apiId = ($_.Name).Replace(' ', '-').ToLower()
+                              $specFile = Get-ChildItem -Path $_.FullName -Recurse -Include "specification.yaml", "specification.yml", "specification.json" | Select-Object -First 1
+                              $apiInfoFile = Join-Path $_.FullName "apiInformation.json"
+                              $apiInfo = Get-Content -Path $apiInfoFile | ConvertFrom-Json
+                              
+                              az apim api import --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --api-id $apiId --path $apiId --display-name $_.Name --specification-format OpenApi --specification-path $specFile.FullName --service-url $apiInfo.properties.serviceUrl
+                              az apim product api add --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --product-id "dev" --api-id $apiId
+                          }
+                      }
+
+                      # Deploy Named Values
+                      $namedValuesBaseFolder = Join-Path $baseFolder "named values"
+                      if (Test-Path -Path $namedValuesBaseFolder) {
+                          $keyVaultName = "$(KEY_VAULT_NAME)"
+                          Get-ChildItem -Path $namedValuesBaseFolder -Directory | ForEach-Object {
+                              $namedValueId = $_.Name
+                              $configFile = Join-Path $_.FullName "namedValueInformation.json"
+                              $config = Get-Content -Path $configFile | ConvertFrom-Json
+                              $isSecret = $config.properties.secret
+                              $finalValue = $config.properties.value
+
+                              if ($isSecret -eq $true) {
+                                  $secretDetails = az keyvault secret show --vault-name $keyVaultName --name $namedValueId | ConvertFrom-Json
+                                  $finalValue = $secretDetails.id
+                              }
+                              az apim nv create --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --named-value-id $namedValueId --display-name $config.properties.displayName --secret $isSecret --value $finalValue
+                          }
+                      }
+                      
+                - task: PowerShell@2
+                  displayName: "Update 'apim-version' Named Value"
+                  inputs:
+                    targetType: 'inline'
+                    pwsh: true
+                    script: |
+                      # This task uses the Azure REST API to update the version tracker in APIM.
+                      $newVersion = "${{ parameters.APIM_VERSION }}"
+                      $subscriptionId = az account show --query id -o tsv
+                      $url = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$(CurrentResourceGroupName)/providers/Microsoft.ApiManagement/service/$(CurrentApimInstanceName)/namedValues/apim-version`?api-version=2022-08-01"
+                      $bodyObj = @{ properties = @{ displayName = "apim-version"; value = $newVersion; secret = $false } }
+                      $body = $bodyObj | ConvertTo-Json -Depth 5
+                      az rest --method PUT --url $url --body $body --headers '{"Content-Type":"application/json"}'
+
+  # ===================================================================
+  # STAGE 2: DEPLOY TO PRODUCTION ENVIRONMENT
+  # ===================================================================
+  - stage: Deploy_PROD
+    displayName: 'Deploy APIs to PROD'
+    condition:  eq('${{ parameters.targetEnvironment }}', 'prod')
+    jobs:
+      - deployment: Deploy_APIs_PROD
+        displayName: 'Publishing to APIM PROD'
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: PowerShell@2
+                  displayName: 'Publish APIs & Named Values to APIM PROD'
+                  inputs:
+                    targetType: 'inline'
+                    pwsh: true
+                    script: |
+                      # This script deploys APIs and Named Values to the Production environment.
+                      # It securely handles secrets by creating references to Azure Key Vault.
+
+                      $newVersion = "${{ parameters.APIM_VERSION }}"
+                      if ([string]::IsNullOrWhiteSpace($newVersion)) {
+                          throw "APIM_VERSION parameter is missing or empty. Aborting deployment."
+                      }
+                      $baseFolder = "$(System.DefaultWorkingDirectory)/${{ parameters.API_FOLDER_PATH }}"
+                      
+                      # Deploy APIs
+                      $apisPath = Join-Path $baseFolder "apis"
+                      if (Test-Path -Path $apisPath) {
+                          Get-ChildItem -Path $apisPath -Directory | ForEach-Object {
+                              $apiId = ($_.Name).Replace(' ', '-').ToLower()
+                              $specFile = Get-ChildItem -Path $_.FullName -Recurse -Include "specification.yaml", "specification.yml", "specification.json" | Select-Object -First 1
+                              $apiInfoFile = Join-Path $_.FullName "apiInformation.json"
+                              $apiInfo = Get-Content -Path $apiInfoFile | ConvertFrom-Json
+                              
+                              az apim api import --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --api-id $apiId --path $apiId --display-name $_.Name --specification-format OpenApi --specification-path $specFile.FullName --service-url $apiInfo.properties.serviceUrl
+                              az apim product api add --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --product-id "prod" --api-id $apiId
+                          }
+                      }
+
+                      # Deploy Named Values
+                      $namedValuesBaseFolder = Join-Path $baseFolder "named values"
+                      if (Test-Path -Path $namedValuesBaseFolder) {
+                          $keyVaultName = "$(KEY_VAULT_NAME)"
+                          Get-ChildItem -Path $namedValuesBaseFolder -Directory | ForEach-Object {
+                              $namedValueId = $_.Name
+                              $configFile = Join-Path $_.FullName "namedValueInformation.json"
+                              $config = Get-Content -Path $configFile | ConvertFrom-Json
+                              $isSecret = $config.properties.secret
+                              $finalValue = $config.properties.value
+
+                              if ($isSecret -eq $true) {
+                                  $secretDetails = az keyvault secret show --vault-name $keyVaultName --name $namedValueId | ConvertFrom-Json
+                                  $finalValue = $secretDetails.id
+                              }
+                              az apim nv create --resource-group "$(CurrentResourceGroupName)" --service-name "$(CurrentApimInstanceName)" --named-value-id $namedValueId --display-name $config.properties.displayName --secret $isSecret --value $finalValue
+                          }
+                      }
+
+                - task: PowerShell@2
+                  displayName: "Update 'apim-version' Named Value"
+                  inputs:
+                    targetType: 'inline'
+                    pwsh: true
+                    script: |
+                      # This task uses the Azure REST API to update the version tracker in APIM.
+                      $newVersion = "${{ parameters.APIM_VERSION }}"
+                      $subscriptionId = az account show --query id -o tsv
+                      $url = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$(CurrentResourceGroupName)/providers/Microsoft.ApiManagement/service/$(CurrentApimInstanceName)/namedValues/apim-version`?api-version=2022-08-01"
+                      $bodyObj = @{ properties = @{ displayName = "apim-version"; value = $newVersion; secret = $false } }
+                      $body = $bodyObj | ConvertTo-Json -Depth 5
+                      az rest --method PUT --url $url --body $body --headers '{"Content-Type":"application/json"}'
