@@ -1,0 +1,663 @@
+# Orchestrator Pipeline
+# This pipeline orchestrates a series of sub-pipelines for a complete CI/CD and security workflow for APIs.
+# 1. Extract: Extracts API definitions from a source (e.g., API Management).
+# 2. Static Security Testing: Performs static analysis on the API definitions.
+# 3. Publish: Publishes the APIs to a target environment.
+# 4. Reachability Test: Verifies that the published API endpoints are reachable.
+# 5. Dynamic Security Testing: Runs dynamic security scans against the live endpoints.
+trigger: none
+
+pool:
+  name: '<your-agent-pool-name>'
+
+parameters:
+# ====================================================================
+# General Parameters
+# ====================================================================
+- name: organizationName
+  type: string
+  default: '<your-org-name>'
+  displayName: 'Azure DevOps Organization Name'
+- name: projectName
+  type: string
+  default: '<your-project-name>'
+  displayName: 'Azure DevOps Project Name'
+- name: repositoryName
+  type: string
+  default: '<your-repo-name>'
+  displayName: 'Repository for pull request'
+- name: apiManagementResourceGroup
+  displayName: 'API Management instance resource group name'
+  type: string
+  default: '<your-apim-resource-group>'
+- name: azureServiceConnection
+  type: string
+  default: '<your-azure-service-connection>'
+  displayName: 'Primary Azure Service Connection'
+
+# ====================================================================
+# 1. Extractor Pipeline Parameters
+# ====================================================================
+- name: extractorPipelineName
+  type: string
+  default: 'api-extractor'
+  displayName: 'Extractor Pipeline Name'
+- name: extractorTargetEnvironment
+  displayName: 'Target Environment to Extract from'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - prod
+- name: extractionTargetFolder
+  displayName: 'Target folder for extracted API definitions'
+  type: string
+  default: 'api-definitions'
+- name: extractionTargetBranch
+  type: string
+  displayName: 'Target branch for pull request'
+  default: 'main'
+- name: extractorConfigurationFile
+  type: string
+  displayName: 'Optional configuration file for extraction'
+  default: 'extractor-config.yaml'
+- name: apiSpecificationFormat
+  type: string
+  displayName: 'API Specification Format'
+  default: 'OpenAPIV3Yaml'
+  values:
+  - OpenAPIV3Yaml
+  - OpenAPIV3Json
+  - OpenAPIV2Yaml
+  - OpenAPIV2Json
+- name: apiManagementVersionKey
+  type: string
+  displayName: 'Named value ID for APIM version'
+  default: 'apim-version'
+
+# ====================================================================
+# 2. Static Security Testing Parameters
+# ====================================================================
+- name: staticSecurityPipelineName
+  type: string
+  default: 'static-security-testing'
+  displayName: 'Static Security Pipeline Name'
+- name: apiDirectoryToScan
+  type: string
+  default: 'api-to-scan'
+  displayName: 'API directory to scan'
+- name: waitForStaticSecurityScan
+  displayName: 'Wait for Static Security Scan to complete?'
+  type: boolean
+  default: true
+
+# ====================================================================
+# 3. Publisher Pipeline Parameters
+# ====================================================================
+- name: publisherPipelineName
+  type: string
+  default: 'api-publisher'
+  displayName: 'Publisher Pipeline Name'
+- name: publisherTargetEnvironment
+  displayName: 'Target Environment for publishing'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - prod
+- name: sourceApiFolderPath
+  type: string
+  displayName: 'Folder containing APIs to publish'
+  default: 'apis-to-publish/dev'
+- name: apiVersionToPublish
+  type: string
+  displayName: 'Specific API Version to publish (optional)'
+  default: ''
+
+# ====================================================================
+# 4. Reachability Test Parameters
+# ====================================================================
+- name: reachabilityTestPipelineName
+  type: string
+  default: 'reachability-test'
+  displayName: 'Reachability Test Pipeline Name'
+- name: reachabilityTestTargetEnvironment
+  displayName: 'Target Environment for Tests'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - prod
+- name: previousStableApiTag
+  type: string
+  default: '1.0.0'
+  displayName: 'Previous Stable API Version Tag for rollback'
+- name: restoreOnFailureFolder
+  displayName: 'Source folder of APIs to restore on failure'
+  type: string
+  default: 'api-definitions'
+
+# ====================================================================
+# 5. Dynamic Security Testing Parameters
+# ====================================================================
+- name: dynamicScanPipelineName
+  type: string
+  default: 'dynamic-security-testing'
+  displayName: 'Dynamic Scan Pipeline Name'
+- name: dynamicScanTargetEnvironment
+  displayName: 'Target Environment for Dynamic Scan'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - prod
+- name: apiListForDynamicScan
+  displayName: 'List of APIs for Dynamic Scan (JSON format)'
+  type: string
+  default: '[{"name": "example-api"}]'
+- name: waitForDynamicSecurityScan
+  displayName: 'Wait for Dynamic Security Scan to complete?'
+  type: boolean
+  default: true
+
+# ====================================================================
+# Security Gate Parameters (for Dynamic Scan)
+# ====================================================================
+- name: securityGateMode
+  displayName: 'Risk Evaluation Mode (Security Gate)'
+  type: string
+  default: 'flexible'
+  values:
+  - cvss_only
+  - severity_only
+  - flexible
+  - strict
+- name: cvssScoreThreshold
+  displayName: 'General CVSS Threshold'
+  type: number
+  default: 7.0
+- name: failOnSeverityLevels
+  displayName: 'Fail on these Severity Levels (comma-separated)'
+  type: string
+  default: 'Critical,High'
+- name: criticalVulnerabilityTypes
+  displayName: 'Critical Vulnerability Types (comma-separated)'
+  type: string
+  default: 'authentication,authorization,injection'
+- name: strictMethods
+  displayName: 'HTTP Methods for Stricter Checks (for strict mode)'
+  type: string
+  default: 'GET,POST,PUT,DELETE'
+- name: strictMethodsCvssThreshold
+  displayName: 'CVSS Threshold for Strict Methods (for strict mode)'
+  type: number
+  default: 5.0
+
+stages:
+# ====================================================================
+# STAGE 1: Extract API Definitions
+# ====================================================================
+- stage: RunExtractor
+  displayName: '1. Extract API Definitions'
+  jobs:
+  - job: TriggerExtractor
+    displayName: 'Trigger Extractor Pipeline'
+    steps:
+    - task: Bash@3
+      name: getExtractorPipelineId
+      displayName: 'Get Extractor Pipeline ID'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          PIPELINE_NAME="${{ parameters.extractorPipelineName }}"
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines?api-version=7.1"
+          
+          echo "Looking up pipeline ID for: '$PIPELINE_NAME'"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$API_URL")
+          PIPELINE_ID=$(echo "$RESPONSE" | jq -r ".value[] | select(.name==\"$PIPELINE_NAME\") | .id")
+
+          if [ -z "$PIPELINE_ID" ]; then
+            echo "##[error]Pipeline '$PIPELINE_NAME' not found in project '$PROJECT_NAME'."
+            exit 1
+          fi
+
+          echo "Found pipeline ID: $PIPELINE_ID"
+          echo "##vso[task.setvariable variable=PIPELINE_ID;isOutput=true]$PIPELINE_ID"
+
+    - task: Bash@3
+      displayName: 'Trigger and Monitor Extractor Pipeline'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: inline
+        script: |
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          PIPELINE_ID="$(getExtractorPipelineId.PIPELINE_ID)"
+          
+          JSON_PAYLOAD=$(jq -n \
+            --arg env "${{ parameters.extractorTargetEnvironment }}" \
+            --arg folder "${{ parameters.extractionTargetFolder }}" \
+            --arg repo "${{ parameters.repositoryName }}" \
+            --arg branch "${{ parameters.extractionTargetBranch }}" \
+            --arg conf "${{ parameters.extractorConfigurationFile }}" \
+            --arg format "${{ parameters.apiSpecificationFormat }}" \
+            --arg version "${{ parameters.apiManagementVersionKey }}" \
+            '{
+              templateParameters: {
+                targetEnvironment: $env,
+                TARGET_FOLDER: $folder,
+                REPOSITORY_NAME: $repo,
+                TARGET_BRANCH_NAME: $branch,
+                CONFIGURATION_YAML_PATH: $conf,
+                API_SPECIFICATION_FORMAT: $format,
+                APIM_VERSION: $version
+              }
+            }')
+          
+          echo "Triggering pipeline run..."
+          RUN_API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1"
+          RUN_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$RUN_API_URL")
+          RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id')
+
+          if [ "$RUN_ID" == "null" ] || [ -z "$RUN_ID" ]; then
+            echo "##[error]Failed to trigger pipeline. Response:"
+            echo "$RUN_RESPONSE"
+            exit 1
+          fi
+          echo "Pipeline triggered with run ID: $RUN_ID. Monitoring for completion..."
+
+          while true; do
+            STATUS_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs/$RUN_ID?api-version=7.1"
+            STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$STATUS_URL")
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state')
+            echo "Current run status: $STATE"
+
+            if [ "$STATE" == "completed" ]; then
+              RESULT=$(echo "$STATUS_RESPONSE" | jq -r '.result')
+              if [ "$RESULT" != "succeeded" ]; then
+                echo "##[error]Pipeline run failed with result: $RESULT"
+                exit 1
+              fi
+              echo "Pipeline completed successfully."
+              break
+            fi
+            sleep 15
+          done
+
+# ====================================================================
+# STAGE 2: Static Security Testing
+# ====================================================================
+- stage: RunStaticSecurityTesting
+  displayName: '2. Run Static Security Testing'
+  dependsOn: RunExtractor
+  condition: succeeded()
+  jobs:
+  - job: TriggerStaticSecurityScan
+    displayName: 'Trigger Static Security Scan Pipeline'
+    steps:
+    - task: Bash@3
+      name: getStaticScanPipelineId
+      displayName: 'Get Static Security Pipeline ID'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          PIPELINE_NAME="${{ parameters.staticSecurityPipelineName }}"
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines?api-version=7.1"
+
+          echo "Looking up pipeline ID for: '$PIPELINE_NAME'"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$API_URL")
+          PIPELINE_ID=$(echo "$RESPONSE" | jq -r ".value[] | select(.name==\"$PIPELINE_NAME\") | .id")
+
+          if [ -z "$PIPELINE_ID" ]; then
+            echo "##[error]Pipeline '$PIPELINE_NAME' not found."
+            exit 1
+          fi
+
+          echo "Found pipeline ID: $PIPELINE_ID"
+          echo "##vso[task.setvariable variable=PIPELINE_ID;isOutput=true]$PIPELINE_ID"
+
+    - task: Bash@3
+      displayName: 'Trigger and Monitor Static Scan'
+      env:
+        WAIT_FOR_SCAN: ${{ parameters.waitForStaticSecurityScan }}
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: inline
+        script: |
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          PIPELINE_ID="$(getStaticScanPipelineId.PIPELINE_ID)"
+          
+          JSON_PAYLOAD=$(jq -n \
+            --arg apiDir "${{ parameters.apiDirectoryToScan }}" \
+            '{ templateParameters: { API_DIR: $apiDir } }')
+          
+          echo "Triggering pipeline run..."
+          RUN_API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1"
+          RUN_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$RUN_API_URL")
+          RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id')
+
+          if [ "$RUN_ID" == "null" ] || [ -z "$RUN_ID" ]; then
+            echo "##[error]Failed to trigger pipeline. Response: $RUN_RESPONSE"
+            exit 1
+          fi
+          echo "Pipeline triggered with run ID: $RUN_ID."
+
+          if [ "$WAIT_FOR_SCAN" != "true" ]; then
+            echo "Scan triggered. Not waiting for completion as per configuration."
+            exit 0
+          fi
+
+          echo "Monitoring for completion..."
+          while true; do
+            STATUS_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs/$RUN_ID?api-version=7.1"
+            STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$STATUS_URL")
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state')
+            echo "Current run status: $STATE"
+
+            if [ "$STATE" == "completed" ]; then
+              RESULT=$(echo "$STATUS_RESPONSE" | jq -r '.result')
+              if [ "$RESULT" != "succeeded" ]; then
+                echo "##[error]Pipeline run failed with result: $RESULT"
+                exit 1
+              fi
+              echo "Pipeline completed successfully."
+              break
+            fi
+            sleep 15
+          done
+
+# ====================================================================
+# STAGE 3: Publish to Environment
+# ====================================================================
+- stage: RunPublish
+  displayName: '3. Publish to Environment'
+  dependsOn: RunStaticSecurityTesting
+  condition: and(succeeded(), eq(${{ parameters.waitForStaticSecurityScan }}, true))
+  jobs:
+  - deployment: PublishToEnvironment
+    displayName: 'Deploying to ${{ parameters.publisherTargetEnvironment }}'
+    environment: '${{ parameters.publisherTargetEnvironment }}'
+    pool:
+      name: '<your-agent-pool-name>'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Bash@3
+            name: getPublisherPipelineId
+            displayName: 'Get Publisher Pipeline ID'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            inputs:
+              targetType: 'inline'
+              script: |
+                PIPELINE_NAME="${{ parameters.publisherPipelineName }}"
+                ORG_NAME="${{ parameters.organizationName }}"
+                PROJECT_NAME="${{ parameters.projectName }}"
+                API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines?api-version=7.1"
+
+                echo "Looking up pipeline ID for: '$PIPELINE_NAME'"
+                RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$API_URL")
+                PIPELINE_ID=$(echo "$RESPONSE" | jq -r ".value[] | select(.name==\"$PIPELINE_NAME\") | .id")
+
+                if [ -z "$PIPELINE_ID" ]; then
+                  echo "##[error]Pipeline '$PIPELINE_NAME' not found."
+                  exit 1
+                fi
+                echo "Found pipeline ID: $PIPELINE_ID"
+                echo "##vso[task.setvariable variable=PIPELINE_ID;isOutput=true]$PIPELINE_ID"
+
+          - task: Bash@3
+            displayName: 'Trigger and Monitor Publisher Pipeline'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            inputs:
+              targetType: 'inline'
+              script: |
+                ORG_NAME="${{ parameters.organizationName }}"
+                PROJECT_NAME="${{ parameters.projectName }}"
+                PIPELINE_ID="$(getPublisherPipelineId.PIPELINE_ID)"
+                
+                JSON_PAYLOAD=$(jq -n \
+                  --arg env "${{ parameters.publisherTargetEnvironment }}" \
+                  --arg path "${{ parameters.sourceApiFolderPath }}" \
+                  --arg version "${{ parameters.apiVersionToPublish }}" \
+                  '{
+                    templateParameters: {
+                      targetEnvironment: $env,
+                      API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH: $path,
+                      API_VERSION: $version
+                    }
+                  }')
+
+                echo "Triggering pipeline run..."
+                RUN_API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1"
+                RUN_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$RUN_API_URL")
+                RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id')
+
+                if [ "$RUN_ID" == "null" ] || [ -z "$RUN_ID" ]; then
+                  echo "##[error]Failed to trigger pipeline. Response: $RUN_RESPONSE"
+                  exit 1
+                fi
+                echo "Pipeline triggered with run ID: $RUN_ID. Monitoring for completion..."
+
+                while true; do
+                  STATUS_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs/$RUN_ID?api-version=7.1"
+                  STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$STATUS_URL")
+                  STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state')
+                  echo "Current run status: $STATE"
+
+                  if [ "$STATE" == "completed" ]; then
+                    RESULT=$(echo "$STATUS_RESPONSE" | jq -r '.result')
+                    if [ "$RESULT" != "succeeded" ]; then
+                      echo "##[error]Pipeline run failed with result: $RESULT"
+                      exit 1
+                    fi
+                    echo "Pipeline completed successfully."
+                    break
+                  fi
+                  sleep 15
+                done
+                
+# ====================================================================
+# STAGE 4: Reachability Test
+# ====================================================================
+- stage: RunReachabilityTest
+  displayName: '4. Run Reachability Test'
+  dependsOn: RunPublish
+  condition: succeeded()
+  jobs:
+  - job: TriggerReachabilityTest
+    displayName: 'Trigger Reachability Test Pipeline'
+    steps:
+    - task: Bash@3
+      name: getReachabilityPipelineId
+      displayName: 'Get Reachability Test Pipeline ID'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          PIPELINE_NAME="${{ parameters.reachabilityTestPipelineName }}"
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines?api-version=7.1"
+
+          echo "Looking up pipeline ID for: '$PIPELINE_NAME'"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$API_URL")
+          PIPELINE_ID=$(echo "$RESPONSE" | jq -r ".value[] | select(.name==\"$PIPELINE_NAME\") | .id")
+
+          if [ -z "$PIPELINE_ID" ]; then
+            echo "##[error]Pipeline '$PIPELINE_NAME' not found."
+            exit 1
+          fi
+          echo "Found pipeline ID: $PIPELINE_ID"
+          echo "##vso[task.setvariable variable=PIPELINE_ID;isOutput=true]$PIPELINE_ID"
+
+    - task: Bash@3
+      displayName: 'Trigger and Monitor Reachability Test'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          PIPELINE_ID="$(getReachabilityPipelineId.PIPELINE_ID)"
+          
+          JSON_PAYLOAD=$(jq -n \
+            --arg targetEnv "${{ parameters.reachabilityTestTargetEnvironment }}" \
+            --arg restoreFolder "${{ parameters.restoreOnFailureFolder }}" \
+            --arg previousTag "${{ parameters.previousStableApiTag }}" \
+            '{
+              templateParameters: {
+                targetEnvironment: $targetEnv,
+                restoreFolder: $restoreFolder,
+                previousStableTag: $previousTag
+              }
+            }')
+
+          echo "Triggering pipeline run..."
+          RUN_API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1"
+          RUN_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$RUN_API_URL")
+          RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id')
+
+          if [ "$RUN_ID" == "null" ] || [ -z "$RUN_ID" ]; then
+            echo "##[error]Failed to trigger pipeline. Response: $RUN_RESPONSE"
+            exit 1
+          fi
+          echo "Pipeline triggered with run ID: $RUN_ID. Monitoring for completion..."
+
+          while true; do
+            STATUS_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs/$RUN_ID?api-version=7.1"
+            STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$STATUS_URL")
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state')
+            echo "Current run status: $STATE"
+
+            if [ "$STATE" == "completed" ]; then
+              RESULT=$(echo "$STATUS_RESPONSE" | jq -r '.result')
+              if [ "$RESULT" != "succeeded" ]; then
+                echo "##[error]Pipeline run failed with result: $RESULT"
+                exit 1
+              fi
+              echo "Pipeline completed successfully."
+              break
+            fi
+            sleep 15
+          done
+          
+# ====================================================================
+# STAGE 5: Dynamic Security Testing
+# ====================================================================
+- stage: RunDynamicSecurityScan
+  displayName: '5. Run Dynamic Security Scan'
+  dependsOn: RunReachabilityTest
+  condition: succeeded()
+  jobs:
+  - job: TriggerDynamicScan
+    displayName: 'Trigger Dynamic Security Scan Pipeline'
+    steps:
+    - task: Bash@3
+      name: getDynamicScanPipelineId
+      displayName: 'Get Dynamic Scan Pipeline ID'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          PIPELINE_NAME="${{ parameters.dynamicScanPipelineName }}"
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines?api-version=7.1"
+
+          echo "Looking up pipeline ID for: '$PIPELINE_NAME'"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$API_URL")
+          PIPELINE_ID=$(echo "$RESPONSE" | jq -r ".value[] | select(.name==\"$PIPELINE_NAME\") | .id")
+
+          if [ -z "$PIPELINE_ID" ]; then
+            echo "##[error]Pipeline '$PIPELINE_NAME' not found."
+            exit 1
+          fi
+          echo "Found pipeline ID: $PIPELINE_ID"
+          echo "##vso[task.setvariable variable=PIPELINE_ID;isOutput=true]$PIPELINE_ID"
+
+    - task: Bash@3
+      displayName: 'Trigger and Monitor Dynamic Scan'
+      env:
+        WAIT_FOR_SCAN: ${{ parameters.waitForDynamicSecurityScan }}
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          ORG_NAME="${{ parameters.organizationName }}"
+          PROJECT_NAME="${{ parameters.projectName }}"
+          PIPELINE_ID="$(getDynamicScanPipelineId.PIPELINE_ID)"
+
+          JSON_PAYLOAD=$(jq -n \
+            --arg serviceConnection "${{ parameters.azureServiceConnection }}" \
+            --argjson apiList '${{ parameters.apiListForDynamicScan }}' \
+            --arg targetEnv "${{ parameters.dynamicScanTargetEnvironment }}" \
+            --arg securityMode "${{ parameters.securityGateMode }}" \
+            --arg cvssThreshold "${{ parameters.cvssScoreThreshold }}" \
+            --arg severityLevels "${{ parameters.failOnSeverityLevels }}" \
+            --arg criticalTypes "${{ parameters.criticalVulnerabilityTypes }}" \
+            --arg strictMethods "${{ parameters.strictMethods }}" \
+            --arg strictCvssThreshold "${{ parameters.strictMethodsCvssThreshold }}" \
+            '{
+              templateParameters: {
+                AZURE_SERVICE_CONNECTION: $serviceConnection,
+                API_LIST: $apiList,
+                targetEnvironment: $targetEnv,
+                SECURITY_GATE_MODE: $securityMode,
+                CVSS_SCORE_THRESHOLD: ($cvssThreshold | tonumber),
+                FAIL_ON_SEVERITY_LEVELS: $severityLevels,
+                CRITICAL_VULNERABILITY_TYPES: $criticalTypes,
+                STRICT_METHODS: $strictMethods,
+                STRICT_METHODS_CVSS_THRESHOLD: ($strictCvssThreshold | tonumber)
+              }
+            }')
+
+          echo "Triggering pipeline run..."
+          RUN_API_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs?api-version=7.1"
+          RUN_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$RUN_API_URL")
+          RUN_ID=$(echo "$RUN_RESPONSE" | jq -r '.id')
+
+          if [ "$RUN_ID" == "null" ] || [ -z "$RUN_ID" ]; then
+            echo "##[error]Failed to trigger pipeline. Response: $RUN_RESPONSE"
+            exit 1
+          fi
+          echo "Pipeline triggered with run ID: $RUN_ID."
+
+          if [ "$WAIT_FOR_SCAN" != "true" ]; then
+            echo "Scan triggered. Not waiting for completion as per configuration."
+            exit 0
+          fi
+
+          echo "Monitoring for completion..."
+          while true; do
+            STATUS_URL="https://dev.azure.com/$ORG_NAME/$PROJECT_NAME/_apis/pipelines/$PIPELINE_ID/runs/$RUN_ID?api-version=7.1"
+            STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" "$STATUS_URL")
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.state')
+            echo "Current run status: $STATE"
+
+            if [ "$STATE" == "completed" ]; then
+              RESULT=$(echo "$STATUS_RESPONSE" | jq -r '.result')
+              if [ "$RESULT" != "succeeded" ]; then
+                echo "##[error]Pipeline run failed with result: $RESULT"
+                exit 1
+              fi
+              echo "Pipeline completed successfully."
+              break
+            fi
+            sleep 15
+          done
