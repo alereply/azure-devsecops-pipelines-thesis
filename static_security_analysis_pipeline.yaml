@@ -1,0 +1,194 @@
+parameters:
+  - name: API_DIR
+    type: string
+    default: 'src' # Using a generic default like 'src'
+    displayName: 'API directory to scan'
+
+trigger: none
+
+variables:
+  # Replace with the names of your variable groups in Azure DevOps
+  - group: '<your-cosign-secrets-variable-group>'
+  - group: '<your-blob-storage-variable-group>'
+  - group: '<your-general-automation-variable-group>'
+
+# --------------------------------------------------------------
+#  STAGE 1 – SECURITY SCANNING
+# --------------------------------------------------------------
+stages:
+- stage: Security_Scan
+  displayName: "Stage 1: Perform Security Analysis"
+  jobs:
+    - job: security_checks
+      displayName: "Run SAST, OpenAPI Linting, and Secret Scanning"
+      pool:
+        name: '<your-agent-pool-name>'
+
+      steps:
+        - checkout: self
+          clean: true
+
+        # Download secrets (like Cosign keys) from Azure Key Vault
+        - task: AzureKeyVault@2
+          inputs:
+            azureSubscription: '<your-service-connection-for-kv>'
+            KeyVaultName: '$(cosignKeyVaultName)' # From variable group
+            SecretsFilter: '*'
+
+        # Install the necessary toolchain (e.g., Spectral, TruffleHog)
+        - bash: |
+            dos2unix '$(Build.SourcesDirectory)/requirements.sh'
+            chmod +x '$(Build.SourcesDirectory)/requirements.sh'
+            '$(Build.SourcesDirectory)/requirements.sh'
+          displayName: 'Install DevSecOps toolchain'
+      
+        # SonarQube SAST Analysis
+        - task: SonarQubePrepare@7
+          displayName: 'Prepare SonarQube Analysis'
+          inputs:
+            SonarQube: '<your-sonarqube-service-connection>'
+            scannerMode: 'cli'
+            configMode: 'manual'
+            cliProjectKey: '<your-sonarqube-project-key>'
+            cliSources: '${{ parameters.API_DIR }}'
+
+        - task: SonarQubeAnalyze@7
+          displayName: 'Run SonarQube Scanner'
+
+        - task: SonarQubePublish@7
+          displayName: 'Publish SonarQube Quality Gate'
+
+        # Prepare artifact folders and decode Cosign keys from secrets
+        - bash: |
+            mkdir -p "$(Build.ArtifactStagingDirectory)/worm-upload"
+            mkdir -p "$(Build.ArtifactStagingDirectory)/signatures"
+            
+            echo "$(cosign-private-key)" | base64 -d > cosign.key
+            echo "$(cosign-public-key)"  | base64 -d > cosign.pub
+          displayName: 'Prepare artifact directories & decode Cosign keys'
+
+        # Spectral OpenAPI Linting
+        - bash: |
+            # Run Spectral linting against the specified API directory
+            spectral lint ./${{ parameters.API_DIR }}/**/*.{json,yml,yaml} \
+            --ruleset "$(System.DefaultWorkingDirectory)/.spectral/spectral.yaml" \
+            --fail-severity warn \
+            --format html \
+            --output "$(Build.ArtifactStagingDirectory)/worm-upload/spectral-report.html" \
+            --verbose || echo "Spectral completed with violations"
+          displayName: 'Run Spectral OpenAPI Linting'
+          continueOnError: true
+
+        - bash: |
+            # Sign the report with Cosign
+            cosign sign-blob --yes \
+            --key cosign.key "$(Build.ArtifactStagingDirectory)/worm-upload/spectral-report.html" \
+            --output-signature "$(Build.ArtifactStagingDirectory)/signatures/spectral-report.html.sig"
+
+            # Verify the signature to ensure integrity
+            cosign verify-blob \
+            --key cosign.pub \
+            --signature "$(Build.ArtifactStagingDirectory)/signatures/spectral-report.html.sig" "$(Build.ArtifactStagingDirectory)/worm-upload/spectral-report.html"
+          displayName: 'Sign & verify Spectral report'
+          env:
+            COSIGN_PASSWORD: $(cosign-password)
+        
+        # TruffleHog Secret Scanning
+        - bash: |
+            # Run TruffleHog against the specified API directory
+            trufflehog filesystem ./${{ parameters.API_DIR }} \
+              --json \
+              > "$(Build.ArtifactStagingDirectory)/worm-upload/trufflehog.json"
+          displayName: 'Run TruffleHog Secret Scanner'
+
+        - bash: |
+            # Sign the TruffleHog report
+            cosign sign-blob --yes \
+            --key cosign.key "$(Build.ArtifactStagingDirectory)/worm-upload/trufflehog.json" \
+            --output-signature "$(Build.ArtifactStagingDirectory)/signatures/trufflehog.json.sig"
+
+            # Verify the signature
+            cosign verify-blob \
+            --key cosign.pub \
+            --signature "$(Build.ArtifactStagingDirectory)/signatures/trufflehog.json.sig" "$(Build.ArtifactStagingDirectory)/worm-upload/trufflehog.json"
+          displayName: 'Sign & verify TruffleHog report'
+          env:
+            COSIGN_PASSWORD: $(cosign-password)
+          condition: always()
+
+        # Create a ZIP archive with all reports and signatures
+        - bash: |
+            cd "$(Build.ArtifactStagingDirectory)"
+            report_name="static-scan-report-$(date +%Y%m%dT%H%M%S).zip"
+
+            zip "$report_name" \
+              worm-upload/spectral-report.html \
+              worm-upload/trufflehog.json \
+              signatures/spectral-report.html.sig \
+              signatures/trufflehog.json.sig
+
+            echo "$report_name" > report_name.txt
+          displayName: "Create ZIP archive of signed reports"
+          condition: always()
+          
+        # Publish the ZIP as a pipeline artifact
+        - publish: '$(Build.ArtifactStagingDirectory)'
+          artifact: DevSecOps-reports
+          displayName: "Publish reports artifact for next stage"
+          condition: always()
+
+        # Securely delete the decoded keys from the agent
+        - bash: shred -u cosign.key cosign.pub
+          displayName: 'Delete Cosign keys from agent'
+          condition: always()
+
+# --------------------------------------------------------------
+#  STAGE 2 – UPLOAD EVIDENCE TO WORM STORAGE
+# --------------------------------------------------------------
+- stage: Upload_To_WORM
+  displayName: "Stage 2: Upload Signed Reports to WORM Storage"
+  dependsOn: Security_Scan
+  condition: succeeded()
+  jobs:
+    - deployment: UploadToWORM
+      displayName: "Upload artifacts to Blob WORM container"
+      environment: '<your-worm-deployment-environment-name>'
+      pool:
+        name: '<your-agent-pool-name>'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: none
+
+              - task: DownloadPipelineArtifact@2
+                inputs:
+                  artifact: DevSecOps-reports
+                  path: '$(Build.ArtifactStagingDirectory)'
+
+              - bash: |
+                  set -euo pipefail
+                  # Use the agent's Managed Identity to log in to Azure
+                  az login --identity > /dev/null 2>&1
+                  report_name="$(cat $(Build.ArtifactStagingDirectory)/report_name.txt)"
+
+                  # Upload the report using Managed Identity authentication
+                  az storage blob upload \
+                    --auth-mode login \
+                    --account-name "$AZURE_STORAGE_ACCOUNT" \
+                    --container-name "$AZURE_WORM_CONTAINER" \
+                    --name "$report_name" \
+                    --file "$(Build.ArtifactStagingDirectory)/$report_name" \
+                    --only-show-errors
+                displayName: "Upload ZIP reports to WORM"
+                env:
+                  AZURE_STORAGE_ACCOUNT: $(AZURE_STORAGE_ACCOUNT)
+                  AZURE_WORM_CONTAINER: $(AZURE_WORM_CONTAINER)
+
+              - bash: |
+                  # Clean up downloaded artifacts from the agent
+                  report_name="$(cat $(Build.ArtifactStagingDirectory)/report_name.txt)"
+                  rm -f "$(Build.ArtifactStagingDirectory)/$report_name"
+                  rm -f "$(Build.ArtifactStagingDirectory)/report_name.txt"
+                displayName: "Clean downloaded reports from agent"
+                condition: always()
