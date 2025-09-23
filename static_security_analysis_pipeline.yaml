@@ -34,13 +34,6 @@ stages:
             azureSubscription: '<your-service-connection-for-kv>'
             KeyVaultName: '$(cosignKeyVaultName)' # From variable group
             SecretsFilter: '*'
-
-        # Install the necessary toolchain (e.g., Spectral, TruffleHog)
-        - bash: |
-            dos2unix '$(Build.SourcesDirectory)/requirements.sh'
-            chmod +x '$(Build.SourcesDirectory)/requirements.sh'
-            '$(Build.SourcesDirectory)/requirements.sh'
-          displayName: 'Install DevSecOps toolchain'
       
         # SonarQube SAST Analysis
         - task: SonarQubePrepare@7
